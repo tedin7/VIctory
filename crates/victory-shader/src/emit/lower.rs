@@ -6693,7 +6693,11 @@ mod tests {
 
     #[test]
     fn scalar_64_bit_fields_lower() {
-        for op in [0x9282_9F90, 0x9482_0100, 0x9502_0100] {
+        for (name, op) in [
+            ("s_bfm_b64", 0x9282_9F90),
+            ("s_bfe_u64", 0x9482_0100),
+            ("s_bfe_i64", 0x9502_0100),
+        ] {
             let words = [
                 0xBE80_0380, // s_mov_b32 s0, 0
                 0xBE81_03FF, // s_mov_b32 s1, 0x00400020 (BFE width 64, offset 32)
@@ -6706,7 +6710,16 @@ mod tests {
                 0xBE85_0380, // s_mov_b32 s5, 0
                 S_ENDPGM,
             ];
-            lowers(&words).unwrap();
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            assert!(
+                p.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.name() == name),
+                "{name} did not decode"
+            );
+            lowers(&words).unwrap_or_else(|err| panic!("{name}: {err:?}"));
         }
     }
 
