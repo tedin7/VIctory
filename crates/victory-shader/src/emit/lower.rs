@@ -5259,9 +5259,13 @@ impl<'a> Lower<'a> {
             {
                 (5, 3)
             }
+            // Texel access: the hardware takes (x, y, face) of a cube, or
+            // (x, y, 6 * slice + face) of a cube array, as the layer of a 2D
+            // array, which is how DXIL reads and writes the faces.
+            3 if name.starts_with("image_load") || name == "image_store" => (7, 3),
             4 => (6, 2),
             5 => (7, 3),
-            _ => return Err("an image dimension (cube loads or MSAA)"),
+            _ => return Err("an image dimension (cube atomics or MSAA)"),
         };
         // Address VGPRs in order.
         let mut regs = Vec::new();
@@ -6628,6 +6632,104 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    /// Lowers a compute program that loads an image descriptor from a table
+    /// in user data, zeroes v0-v7 and runs the given image instructions
+    /// (dimension, opcode; address v[0:3], data v[4:7]) on it: the DXIL it
+    /// makes, or why it stops.
+    fn lowers_image(ops: &[(u32, u32)]) -> Result<Vec<u8>, crate::ShaderError> {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let mut words = vec![
+            0xBE82_0308, // s_mov_b32 s2, s8
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0201,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[2:3], null
+        ];
+        // v_mov_b32 v0..v7, 0
+        words.extend((0..8).map(|v| 0x7E00_0280 | v << 17));
+        for &(dim, op) in ops {
+            words.push(0xF000_0F00 | op << 18 | dim << 3); // dmask 0xF
+            words.push(0x0002_0400); // data v[4:7], address v[0:], s[8:15]
+        }
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 8,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 8,
+                dwords: 8,
+                user_data: 8,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|l| l.dxil)
+    }
+
+    const D2: u32 = 1;
+    const CUBE: u32 = 3;
+    const MSAA: u32 = 6;
+    const LOAD: u32 = 0x000;
+    const LOAD_MIP: u32 = 0x001;
+    const STORE: u32 = 0x008;
+
+    /// A cube image is read and written by texel (x, y, face) like a 2D
+    /// array of its faces, which is how DXIL has it: a load, a load of a
+    /// level and a store translate. A load is only kept when something
+    /// uses its result, so each is followed by a store of what it read.
+    #[test]
+    fn cube_texels_are_read_and_written_as_array_layers() {
+        let nothing = lowers_image(&[]).unwrap().len();
+        for ops in [
+            vec![(CUBE, STORE)],
+            vec![(CUBE, LOAD), (D2, STORE)],
+            vec![(CUBE, LOAD_MIP), (D2, STORE)],
+        ] {
+            let dxil = lowers_image(&ops).unwrap_or_else(|e| panic!("{ops:?}: {e}"));
+            assert!(dxil.len() > nothing, "{ops:?}");
+        }
+    }
+
+    /// What this does not cover still stops the translation: multisampled
+    /// images.
+    #[test]
+    fn multisampled_texel_access_still_stops() {
+        assert!(lowers_image(&[(MSAA, STORE)]).is_err());
+        assert!(lowers_image(&[(MSAA, LOAD), (D2, STORE)]).is_err());
     }
 
     #[test]
