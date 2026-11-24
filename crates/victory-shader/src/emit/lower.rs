@@ -2364,8 +2364,13 @@ impl<'a> Lower<'a> {
                 l.s.m.cmp(c, pred::NE, o, z)
             };
             return match name {
-                "s_bcnt1_i32_b64" => {
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" => {
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_bcnt0_i32_b64" {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
                     let i32t = self.s.t.i32;
                     let na = self
                         .s
@@ -2378,6 +2383,48 @@ impl<'a> Lower<'a> {
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
                     self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let a = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                    let b = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                    self.set(lo, Val::I32(b));
+                    self.set(hi, Val::I32(a));
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    let code = dst_code.ok_or("a missing operand")?;
+                    let index = src32(self, 0)?;
+                    // Bit 5 selects the dword, and bits 0-4 select the bit within it.
+                    let (zero, one, k31, k32) = (
+                        self.s.m.i32(0),
+                        self.s.m.i32(1),
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                    );
+                    let shift = self.s.m.bin(c, Bin::And, index, k31);
+                    let bit = self.s.m.bin(c, Bin::Shl, one, shift);
+                    let word = self.s.m.bin(c, Bin::And, index, k32);
+                    let high = self.s.m.cmp(c, pred::NE, word, zero);
+                    for (h, dst) in [(0, lo), (1, hi)] {
+                        let old = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                        let old = self.i32_of(old)?;
+                        let bit = if h == 0 {
+                            self.s.m.select(c, high, zero, bit)
+                        } else {
+                            self.s.m.select(c, high, bit, zero)
+                        };
+                        let r = if name == "s_bitset1_b64" {
+                            self.s.m.bin(c, Bin::Or, old, bit)
+                        } else {
+                            let ones = self.s.m.i32(u32::MAX);
+                            let mask = self.s.m.bin(c, Bin::Xor, bit, ones);
+                            self.s.m.bin(c, Bin::And, old, mask)
+                        };
+                        self.set(dst, Val::I32(r));
+                    }
                     Ok(())
                 }
                 "s_ff1_i32_b64" => {
@@ -2550,9 +2597,13 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
             }
-            "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
+            "s_ff1_i32_b32" | "s_bcnt0_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
+                let mut a = src32(self, 0)?;
+                if name == "s_bcnt0_i32_b32" {
+                    let ones = self.s.m.i32(u32::MAX);
+                    a = self.s.m.bin(c, Bin::Xor, a, ones);
+                }
                 let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
                 let r = self
                     .s
@@ -6627,6 +6678,30 @@ mod tests {
         ];
         for words in [add, sub] {
             lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_bit_operations_reach_a_branch() {
+        for (name, op, check) in [
+            ("s_bcnt0_i32_b32", 0xBE80_0D00, 0xBF07_8000),
+            ("s_bcnt0_i32_b64", 0xBE80_0E00, 0xBF07_8000),
+            ("s_brev_b64", 0xBE80_0C00, 0xBF13_0200),
+            ("s_bitset0_b64", 0xBE80_1CA0, 0xBF13_0200),
+            ("s_bitset1_b64", 0xBE80_1EA0, 0xBF13_0200),
+        ] {
+            let words = [
+                0xBE80_0381, // s_mov_b32 s0, 1
+                0xBE81_03C1, // s_mov_b32 s1, -1
+                0xBE82_0380, // s_mov_b32 s2, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                op,          // Count/reverse s0 or s[0:1], or change bit 32 of s[0:1].
+                check,       // s_cmp_lg_u32 s0, 0 or s_cmp_lg_u64 s[0:1], s[2:3]
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE84_0380, // s_mov_b32 s4, 0
+                S_ENDPGM,
+            ];
+            lowers(&words).unwrap_or_else(|err| panic!("{name}: {err:?}"));
         }
     }
 
