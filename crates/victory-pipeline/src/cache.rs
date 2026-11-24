@@ -57,10 +57,27 @@ impl Cache {
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
-        let tmp = tempfile_in(dir);
-        std::fs::write(&tmp, &output)?;
-        std::fs::rename(&tmp, &path)?;
+        let tmp = TempFile(tempfile_in(dir));
+        std::fs::write(&tmp.0, &output)?;
+        if let Err(e) = std::fs::rename(&tmp.0, &path) {
+            // A concurrent run may have published the same entry first; on
+            // Windows the rename then fails if a reader holds it open. The
+            // content is addressed by key, so the existing file is the result.
+            if !path.is_file() {
+                return Err(e).with_context(|| format!("publishing {}", path.display()));
+            }
+        }
         Ok(path)
+    }
+}
+
+/// Removes the temporary file on drop. After a successful rename the file is
+/// gone and the removal is a harmless no-op.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -107,6 +124,26 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_publish_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        // A directory squatting on the entry path makes the final rename fail.
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(cache.get_or_convert(&conv, b"abc").is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "orphans: {leftovers:?}");
     }
 
     #[test]
