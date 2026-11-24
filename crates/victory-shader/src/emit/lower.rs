@@ -4178,6 +4178,8 @@ impl<'a> Lower<'a> {
             "v_fma_f16",
             "v_mad_f16",
             "v_fmac_f16",
+            "v_fmamk_f16",
+            "v_fmaak_f16",
             "v_mac_f16",
             "v_max3_f16",
             "v_min3_f16",
@@ -4294,7 +4296,8 @@ impl<'a> Lower<'a> {
             let r = match name {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_fma_f16" | "v_fmac_f16" | "v_fmamk_f16" | "v_fmaak_f16" | "v_mad_f16"
+                | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.binary(35, a, b);
                     self.binary(35, t, acc)
@@ -4423,7 +4426,9 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+        // `v_pk_fmac_f16` is VOP2: no op_sel, each half reads its own half.
+        let sel = inst.name() == "v_pk_fmac_f16"
+            || (if high { v.opsel_hi } else { v.opsel }) >> k & 1 != 0;
         let x = match op {
             Operand::Const(c @ 240..=248) => {
                 let h = [
@@ -4454,6 +4459,8 @@ impl<'a> Lower<'a> {
         let float = op.ends_with("_f16");
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            // The accumulator is the destination, read below.
+            "fmac_f16" => 2,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
@@ -4482,6 +4489,24 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if op == "fmac_f16" {
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("an accumulator");
+                };
+                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let x = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, x, k16)
+                } else {
+                    x
+                };
+                let m = self.s.m.i32(0xFFFF);
+                let x = self.s.m.bin(c, Bin::And, x, m);
+                xs.push(
+                    self.s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]),
+                );
             }
             let r = if float {
                 let mut f = match op {
@@ -6649,5 +6674,39 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// A program that keeps `op` (and the two constants it reads) alive: the
+    /// result is read back into an SGPR and branched on.
+    fn f16_program(op: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0x7E02_02FF, // v_mov_b32 v1, 0x4000 (2.0 as f16)
+            0x0000_4000,
+            0x7E04_02FF, // v_mov_b32 v2, 0x3c00
+            0x0000_3C00,
+        ];
+        words.extend_from_slice(op);
+        words.extend_from_slice(&[
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    #[test]
+    fn a_half_multiply_add_with_a_literal_translates() {
+        // v_fmamk_f16 v0, v1, 0x4000, v2 and v_fmaak_f16 v0, v1, v2, 0x4000.
+        for op in [[0x6E00_0501, 0x0000_4000], [0x7000_0501, 0x0000_4000]] {
+            lowers(&f16_program(&op)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_packed_half_multiply_accumulate_translates() {
+        // v_pk_fmac_f16 v0, v1, v2.
+        lowers(&f16_program(&[0x7800_0501])).unwrap();
     }
 }
