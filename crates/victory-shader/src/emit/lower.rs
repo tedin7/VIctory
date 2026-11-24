@@ -3869,6 +3869,41 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_cvt_pknorm_i16_f32" | "v_cvt_pknorm_u16_f32" => {
+                // Each source scaled by 32767 (65535), rounded to nearest even
+                // and saturated to the signed (unsigned) 16-bit range, into
+                // the low and high half. A NaN converts to 0.
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let scale = if signed { 32767.0f32 } else { 65535.0 };
+                let scale = self.s.m.f32(scale.to_bits());
+                let mut halves = Vec::new();
+                for k in 0..2 {
+                    let x = f(self, k)?;
+                    let x = self.s.m.bin(c, Bin::Mul, x, scale);
+                    let x = self.unary(26, x);
+                    // The conversion saturates to 32 bits, so the clamp to 16
+                    // follows it in integers.
+                    let x = if signed {
+                        let x = self.s.m.cast(c, Cast::FpToSi, x, self.s.t.i32);
+                        let (lo, hi) = (self.s.m.i32(-32767i32 as u32), self.s.m.i32(32767));
+                        let over = self.s.m.cmp(c, pred::SGT, x, hi);
+                        let x = self.s.m.select(c, over, hi, x);
+                        let under = self.s.m.cmp(c, pred::SLT, x, lo);
+                        self.s.m.select(c, under, lo, x)
+                    } else {
+                        let x = self.s.m.cast(c, Cast::FpToUi, x, self.s.t.i32);
+                        let hi = self.s.m.i32(0xFFFF);
+                        let over = self.s.m.cmp(c, pred::IUGT, x, hi);
+                        self.s.m.select(c, over, hi, x)
+                    };
+                    let mask = self.s.m.i32(0xFFFF);
+                    halves.push(self.s.m.bin(c, Bin::And, x, mask));
+                }
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+                int(self, r)
+            }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
@@ -4873,6 +4908,31 @@ impl<'a> Lower<'a> {
                 let hole = self.s.m.bin(c, Bin::Xor, hole, ones);
                 let d = self.s.m.bin(c, Bin::And, d, hole);
                 self.s.m.bin(c, Bin::Or, d, x)
+            }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // Both sources saturated to the unsigned (signed) 16-bit
+                // range, into the low and high half.
+                let signed = name == "v_cvt_pk_i16_i32";
+                let mut halves = Vec::new();
+                for i in 0..2 {
+                    let x = s(self, i)?;
+                    let x = if signed {
+                        let (lo, hi) = (k(self, -32768i32 as u32), k(self, 32767));
+                        let over = self.s.m.cmp(c, pred::SGT, x, hi);
+                        let x = self.s.m.select(c, over, hi, x);
+                        let under = self.s.m.cmp(c, pred::SLT, x, lo);
+                        self.s.m.select(c, under, lo, x)
+                    } else {
+                        let hi = k(self, 0xFFFF);
+                        let over = self.s.m.cmp(c, pred::IUGT, x, hi);
+                        self.s.m.select(c, over, hi, x)
+                    };
+                    let mask = k(self, 0xFFFF);
+                    halves.push(self.s.m.bin(c, Bin::And, x, mask));
+                }
+                let k16 = k(self, 16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                self.s.m.bin(c, Bin::Or, halves[0], hi)
             }
             "v_ffbl_b32" => {
                 // -1 for zero, as DXIL's first-bit-low.
@@ -6627,6 +6687,42 @@ mod tests {
         ];
         for words in [add, sub] {
             lowers(&words).unwrap();
+        }
+    }
+
+    /// A VOP3 op on v1 of two inline constants (src0, src1), its result
+    /// read to s2 and branched on so that it has an effect.
+    fn vop3_result_used(op: u32, clamp: bool, src0: u32, src1: u32) -> Vec<u32> {
+        vec![
+            0xD500_0001 | op << 16 | u32::from(clamp) << 15, // v_cvt_pk*, v1
+            src0 | src1 << 9,
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn packed_16_bit_conversions_translate() {
+        // v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32 (0.5 and 1.0),
+        // v_cvt_pk_u16_u32 and v_cvt_pk_i16_i32 (1 and 64).
+        for (op, a, b) in [
+            (0x368, 0xF0, 0xF2),
+            (0x369, 0xF0, 0xF2),
+            (0x36A, 0x81, 0xC0),
+            (0x36B, 0x81, 0xC0),
+        ] {
+            lowers(&vop3_result_used(op, false, a, b)).unwrap();
+        }
+    }
+
+    #[test]
+    fn packed_16_bit_conversions_refuse_an_output_clamp() {
+        // The clamp bit has no meaning on a packed result: still refused.
+        for op in [0x368, 0x36B] {
+            assert!(lowers(&vop3_result_used(op, true, 0xF0, 0xF2)).is_err());
         }
     }
 
