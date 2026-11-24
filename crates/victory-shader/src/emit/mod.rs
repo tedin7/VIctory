@@ -594,4 +594,113 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// A pixel shader that cuts EXEC to the lanes where v0 is 0, exports a
+    /// colour (no `done`), then ends with `exp null done vm`: the layout of
+    /// a multi-target or branched pixel shader. The first export was refused
+    /// as "a conditional export", so the whole program could not be used.
+    /// Now it writes the colour only on the lanes still on, and the final
+    /// export (the valid mask) still discards the lanes that are off.
+    fn masked_color_export() -> Vec<u32> {
+        vec![
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0xF800_100F, // exp mrt0 v1 x4 vm
+            0x0101_0101,
+            0xF800_1890, // exp null done vm
+            0,
+            0xBF81_0000, // s_endpgm
+        ]
+    }
+
+    fn translate_pixel(words: &[u32]) -> Result<HostShader, ShaderError> {
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        super::emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// Whether the bitcode declares a function called `name`. Names are
+    /// unabbreviated records (one vbr6 field per character), so the search
+    /// is over the bits of that encoding at every offset.
+    fn declares(dxil: &[u8], name: &str) -> bool {
+        let mut pattern = Vec::new();
+        for ch in name.bytes() {
+            let mut v = u32::from(ch);
+            loop {
+                let low = v & 31;
+                v >>= 5;
+                let chunk = low | if v != 0 { 32 } else { 0 };
+                pattern.extend((0..6).map(|i| chunk >> i & 1 != 0));
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        let bits: Vec<bool> = dxil
+            .iter()
+            .flat_map(|b| (0..8).map(move |i| b >> i & 1 != 0))
+            .collect();
+        bits.windows(pattern.len()).any(|w| w == &pattern[..])
+    }
+
+    #[test]
+    fn a_conditional_color_export_before_the_final_one_translates() {
+        let ps = translate_pixel(&masked_color_export())
+            .expect("exp mrt0 under a partial EXEC, then exp null done vm");
+        assert!(
+            declares(&ps.dxil, "dx.op.storeOutput.f32"),
+            "the colour is stored"
+        );
+        assert!(
+            declares(&ps.dxil, "dx.op.discard"),
+            "off lanes are discarded"
+        );
+    }
+
+    /// Control: a lone conditional export that is the last one (`done`) already worked, by
+    /// discarding the lanes that are off instead of storing under a branch.
+    #[test]
+    fn a_conditional_final_color_export_still_discards() {
+        let words = [
+            0x7E02_02F2,
+            0x7DA4_0080,
+            0xF800_180F,
+            0x0101_0101,
+            0xBF81_0000,
+        ];
+        let ps = translate_pixel(&words).unwrap();
+        assert!(declares(&ps.dxil, "dx.op.storeOutput.f32"));
+        assert!(declares(&ps.dxil, "dx.op.discard"));
+    }
 }

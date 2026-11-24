@@ -6122,13 +6122,19 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            if !self.s.pixel {
                 return Err("a conditional export");
             }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            // The last export decides which pixels are written: a lane that
+            // is off there is discarded. An earlier export under EXEC only
+            // stores for the lanes that are on (below), and leaves the others
+            // to the exports that follow.
+            if e.done {
+                let t = self.s.m.bool(true);
+                let kill = self.s.m.bin(c, Bin::Xor, g, t);
+                self.s
+                    .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            }
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -6255,8 +6261,9 @@ impl<'a> Lower<'a> {
         {
             return Err("a 16-bit output the stage data does not mark");
         }
-        // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        // A mesh lane writes its own vertex or primitive, where it exports;
+        // a pixel's earlier export stores only where its lane is on.
+        let at = if mesh || (self.s.pixel && !e.done) {
             self.begin_guarded(guard)
         } else {
             None
