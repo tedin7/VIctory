@@ -5434,6 +5434,9 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // Comparison gathers; like `image_gather4`, the ones that pick
+            // the level from derivatives (`_c`, `_c_o`) have no DXIL form.
+            "image_gather4_c_lz" | "image_gather4_c_lz_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -5486,7 +5489,7 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
@@ -5660,14 +5663,18 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if op == 74 {
+                        // The reference value follows the channel.
+                        let reference = addr_val(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                    }
+                    let name = if op == 74 {
+                        "textureGatherCmp.f32"
+                    } else {
+                        "textureGather.f32"
+                    };
+                    self.s
+                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
             }
         } else {
@@ -5699,7 +5706,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
@@ -6567,12 +6574,20 @@ mod tests {
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lowered(words, vec![]).map(|_| ())
+    }
+
+    /// Lowers a compute program whose root parameters are `layout`.
+    fn lowered(
+        words: &[u32],
+        layout: Vec<crate::native::RootParam>,
+    ) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 256,
-            layout: vec![],
+            layout,
             used: vec![],
             io: StageIo::Cs(ComputeIo {
                 rsrc2: 0,
@@ -6595,7 +6610,92 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// The image program of `op` (the MIMG opcode, a 2D view, one channel):
+    /// the descriptors loaded from two tables, v2..v5 set, then the
+    /// instruction with its address at v2.
+    fn gather_words(op: u32) -> Vec<u32> {
+        let mut words = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0204,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            // image_gather4* v0, v[2:5], s[0:7], s[8:11] dmask:1 dim:2D
+            0xF000_0108 | (op & 0x7F) << 18,
+            0x0040_0002,
+        ];
+        words.push(S_ENDPGM);
+        words
+    }
+
+    fn gather_dxil(op: u32) -> Vec<u8> {
+        let table = |user_data| crate::native::RootParam {
+            root: crate::native::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        lowered(&gather_words(op), vec![table(8), table(9)])
+            .unwrap()
+            .dxil
+    }
+
+    /// Whether the module declares `name`: the bitcode writes a symbol's
+    /// characters as consecutive 6-bit VBR chunks (low five bits, then a
+    /// continuation bit, for a character from 32 up), which start at any bit.
+    fn has(dxil: &[u8], name: &str) -> bool {
+        let mut pattern = Vec::new();
+        for c in name.bytes() {
+            let chunks = if c < 32 {
+                vec![c]
+            } else {
+                vec![c & 31 | 32, c >> 5]
+            };
+            for chunk in chunks {
+                pattern.extend((0..6).map(|bit| chunk >> bit & 1 != 0));
+            }
+        }
+        let bits: Vec<bool> = dxil
+            .iter()
+            .flat_map(|byte| (0..8).map(move |bit| byte >> bit & 1 != 0))
+            .collect();
+        bits.windows(pattern.len()).any(|w| w == pattern)
+    }
+
+    #[test]
+    fn comparison_gathers_at_level_zero_call_texture_gather_cmp() {
+        // image_gather4_c_lz and image_gather4_c_lz_o (0x04f, 0x05f) are
+        // DXIL's textureGatherCmp (op 74), not textureGather.
+        for op in [0x04F, 0x05F] {
+            let dxil = gather_dxil(op);
+            assert!(has(&dxil, "dx.op.textureGatherCmp.f32"), "{op:#x}");
+            assert!(!has(&dxil, "dx.op.textureGather.f32"), "{op:#x}");
+        }
+        // The plain gather keeps textureGather, with no comparison.
+        let dxil = gather_dxil(0x047);
+        assert!(has(&dxil, "dx.op.textureGather.f32"));
+        assert!(!has(&dxil, "dx.op.textureGatherCmp.f32"));
+    }
+
+    #[test]
+    fn gathers_without_a_dxil_form_call_neither() {
+        // Derivative-picked level (_c), bias (_c_b) and LOD clamp (_c_cl)
+        // have no textureGather operand: they stay missing, not wrong.
+        for op in [0x048, 0x04D, 0x049] {
+            let dxil = gather_dxil(op);
+            assert!(!has(&dxil, "dx.op.textureGatherCmp.f32"), "{op:#x}");
+            assert!(!has(&dxil, "dx.op.textureGather.f32"), "{op:#x}");
+        }
     }
 
     #[test]
