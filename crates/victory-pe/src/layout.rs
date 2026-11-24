@@ -43,8 +43,13 @@ pub mod dir {
 /// `IMAGE_FILE_HEADER::Characteristics` flags.
 pub mod file_flags {
     pub const RELOCS_STRIPPED: u16 = 0x0001;
+    pub const LARGE_ADDRESS_AWARE: u16 = 0x0020;
     pub const DLL: u16 = 0x2000;
 }
+
+/// Addresses at or above this need more than 31 bits. An image without
+/// `LARGE_ADDRESS_AWARE` may hold pointers in 32-bit fields it treats as signed.
+pub const LOW_ADDRESS_LIMIT: u64 = 0x8000_0000;
 
 /// `IMAGE_OPTIONAL_HEADER64::DllCharacteristics` flags.
 pub mod dll_flags {

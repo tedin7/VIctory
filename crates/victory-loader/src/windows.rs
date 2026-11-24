@@ -84,6 +84,18 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    if !loaded
+        .info
+        .base_satisfies_low_requirement(loaded.base() as u64)
+    {
+        tracing::warn!(
+            base = format_args!("{:#x}", loaded.base()),
+            preferred = format_args!("{:#x}", loaded.info.image_base),
+            path = %loaded.path.display(),
+            "image is not large-address-aware but was mapped above 2 GiB; \
+             32-bit pointers in it may be truncated"
+        );
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

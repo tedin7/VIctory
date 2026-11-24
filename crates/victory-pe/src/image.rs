@@ -205,6 +205,28 @@ impl ImageInfo {
         has_flag(self.characteristics, layout::file_flags::DLL)
     }
 
+    pub fn is_large_address_aware(&self) -> bool {
+        has_flag(
+            self.characteristics,
+            layout::file_flags::LARGE_ADDRESS_AWARE,
+        )
+    }
+
+    /// True if the image is not `LARGE_ADDRESS_AWARE` and prefers a base below
+    /// 2 GiB: the title was built to live in the low half of the address space.
+    pub fn requires_low_base(&self) -> bool {
+        !self.is_large_address_aware() && self.image_base < layout::LOW_ADDRESS_LIMIT
+    }
+
+    /// Whether mapping the image at `base` keeps it entirely below 2 GiB when
+    /// it requires that (see [`Self::requires_low_base`]). Always true otherwise.
+    pub fn base_satisfies_low_requirement(&self, base: u64) -> bool {
+        !self.requires_low_base()
+            || base
+                .checked_add(u64::from(self.size_of_image))
+                .is_some_and(|end| end <= layout::LOW_ADDRESS_LIMIT)
+    }
+
     /// Maps an RVA to an offset in the file, if it is backed by file data.
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u32> {
         self.sections.iter().find_map(|s| {
@@ -446,6 +468,48 @@ mod tests {
         // release ones).
         info.sections[0].file_offset = u32::MAX - 0x10;
         assert_eq!(info.rva_to_file_offset(rva), None);
+    }
+
+    /// `synthetic_image` with its characteristics, preferred base and size patched.
+    fn image_with(characteristics: u16, image_base: u64, size_of_image: u32) -> Vec<u8> {
+        let mut d = synthetic_image(&[]);
+        d[0x56..0x58].copy_from_slice(&characteristics.to_le_bytes());
+        d[0x58 + 24..0x58 + 32].copy_from_slice(&image_base.to_le_bytes());
+        d[0x58 + 56..0x58 + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn non_large_address_aware_image_with_low_base_requires_low_base() {
+        let flags = layout::file_flags::LARGE_ADDRESS_AWARE;
+        let low = ImageInfo::parse(&image_with(0, 0x40_0000, 0x2000)).unwrap();
+        assert!(!low.is_large_address_aware());
+        assert!(low.requires_low_base());
+        // Control: the same image with the flag set may go anywhere.
+        let aware = ImageInfo::parse(&image_with(flags, 0x40_0000, 0x2000)).unwrap();
+        assert!(aware.is_large_address_aware());
+        assert!(!aware.requires_low_base());
+        // Control: a high preferred base was never meant for the low half.
+        let high = ImageInfo::parse(&image_with(0, 0x1_4000_0000, 0x2000)).unwrap();
+        assert!(!high.requires_low_base());
+    }
+
+    #[test]
+    fn low_requirement_rejects_bases_whose_image_crosses_2_gib() {
+        let info = ImageInfo::parse(&image_with(0, 0x40_0000, 0x2000)).unwrap();
+        assert!(info.base_satisfies_low_requirement(0x40_0000));
+        assert!(info.base_satisfies_low_requirement(0x8000_0000 - 0x2000));
+        // The image would end one byte past 2 GiB.
+        assert!(!info.base_satisfies_low_requirement(0x8000_0000 - 0x2000 + 1));
+        assert!(!info.base_satisfies_low_requirement(0x7FF0_0000_0000));
+        assert!(!info.base_satisfies_low_requirement(u64::MAX));
+        let aware = ImageInfo::parse(&image_with(
+            layout::file_flags::LARGE_ADDRESS_AWARE,
+            0x40_0000,
+            0x2000,
+        ))
+        .unwrap();
+        assert!(aware.base_satisfies_low_requirement(0x7FF0_0000_0000));
     }
 
     #[test]
