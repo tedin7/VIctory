@@ -74,8 +74,8 @@ impl Op {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// A particular lane of a VGPR value from before the section.
+    Lane(Value, u32),
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
@@ -299,7 +299,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|l| Sym::Lane(x, l)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -395,7 +395,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                        (Sym::K(ident), Some(Sym::Lane(x, src_lane)), Some(m))
+                            if src_lane as usize == l && masked.contains(&m) =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -522,7 +524,7 @@ fn shapes(
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
             op: Some(op),
             src,
@@ -547,6 +549,15 @@ fn shapes(
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     let first = lanes[0];
+    // A pre-section VGPR can be reused only if each lane kept its own value.
+    if let Sym::Lane(x, 0) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(l, &s)| s == Sym::Lane(x, l as u32))
+    {
+        return Some(Shape::Value(x));
+    }
     let own = |l: usize, s: Sym| match s {
         Sym::Red {
             op: None,
@@ -565,7 +576,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     if lanes.iter().all(|&s| s == first) {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::Uni(x) => Some(Shape::Value(x)),
             Sym::Red {
                 op: Some(op),
                 src,
@@ -620,6 +631,46 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vgpr_shapes_preserve_source_lanes() {
+        // Assembled for gfx1030, wave32. Both DPP moves reverse each group of eight.
+        let words: [u32; 10] = [
+            0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+            0x7E04_0301, // v_mov_b32 v2, v1
+            0x7E06_02E9,
+            0x0539_7701, // v_mov_b32_dpp v3, v1
+            0x7E08_02E9,
+            0x0539_7703, // v_mov_b32_dpp v4, v3
+            0xD760_0001,
+            0x0001_0701, // v_readlane_b32 s1, v1, 3
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = crate::ir::build(&code, false, 8).unwrap();
+        let insts = &p.blocks[0].insts;
+        let source = insts[1].read(Reg::V(1)).unwrap();
+        let found = sections(&p, 0);
+        let shape = |i: usize, reg| {
+            let v = insts[i].write(reg).unwrap();
+            found[&0].shapes.get(&v).copied()
+        };
+        assert_eq!(
+            [
+                shape(1, Reg::V(2)),
+                shape(2, Reg::V(3)),
+                shape(3, Reg::V(4)),
+                shape(4, Reg::S(1)),
+            ],
+            [
+                Some(Shape::Value(source)),
+                None,
+                Some(Shape::Value(source)),
+                None
+            ]
+        );
+    }
 
     #[test]
     fn dpp_lanes_follow_the_isa() {
