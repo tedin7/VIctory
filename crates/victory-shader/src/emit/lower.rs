@@ -5802,20 +5802,28 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
-        // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
+        enum Atomic {
+            Bin(u32),
+            CompareExchange,
+            Csub,
+            Inc,
+            Dec,
+        }
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
-            Some("add") => Some(0),
-            Some("and") => Some(1),
-            Some("or") => Some(2),
-            Some("xor") => Some(3),
-            Some("smin") => Some(4),
-            Some("smax") => Some(5),
-            Some("umin") => Some(6),
-            Some("umax") => Some(7),
-            Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
+            Some("add") => Some(Atomic::Bin(0)),
+            Some("and") => Some(Atomic::Bin(1)),
+            Some("or") => Some(Atomic::Bin(2)),
+            Some("xor") => Some(Atomic::Bin(3)),
+            Some("smin") => Some(Atomic::Bin(4)),
+            Some("smax") => Some(Atomic::Bin(5)),
+            Some("umin") => Some(Atomic::Bin(6)),
+            Some("umax") => Some(Atomic::Bin(7)),
+            Some("swap") => Some(Atomic::Bin(8)),
+            Some("cmpswap") => Some(Atomic::CompareExchange),
+            Some("csub") => Some(Atomic::Csub),
+            Some("inc") => Some(Atomic::Inc),
+            Some("dec") => Some(Atomic::Dec),
             Some(_) => return Err(name),
         };
         // d16: two 16-bit channels per VGPR, low half first.
@@ -5900,7 +5908,8 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+            let dwords = 1 + u8::from(matches!(op, Atomic::CompareExchange));
+            let vals = self.vgprs(inst, d, dwords)?;
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -5922,25 +5931,100 @@ impl<'a> Lower<'a> {
             };
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
-                let mut args = vec![h];
-                args.extend(coords);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
+            let [x, y, z] = coords;
+            let compare_exchange = |l: &mut Self, compare, replacement| {
+                l.s.op(
+                    l.cur,
                     "atomicCompareExchange.i32",
                     Attr::NoUnwind,
                     i32t,
                     79,
-                    &args,
+                    &[h, x, y, z, compare, replacement],
                 )
-            } else {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+            };
+            let data = vals[0];
+            let r = match op {
+                Atomic::Bin(op) => {
+                    let op = self.s.m.i32(op);
+                    self.s.op(
+                        self.cur,
+                        "atomicBinOp.i32",
+                        Attr::NoUnwind,
+                        i32t,
+                        78,
+                        &[h, op, x, y, z, data],
+                    )
+                }
+                // cmpswap: data is (new, compare).
+                Atomic::CompareExchange => compare_exchange(self, vals[1], data),
+                Atomic::Csub | Atomic::Inc | Atomic::Dec => {
+                    // A skipped atomic can return an undefined value. Keep
+                    // helper lanes and invalid buffer coordinates out of the loop.
+                    let c = self.cur;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, iu]);
+                    let width = self.s.m.extract(c, d, 0);
+                    let m = &mut self.s.m;
+                    let zero = m.i32(0);
+                    let three = m.i32(3);
+                    let low_bits = m.bin(c, Bin::And, off, three);
+                    let aligned = m.cmp(c, pred::EQ, low_bits, zero);
+                    let in_bounds = m.cmp(c, pred::IULT, x, width);
+                    let mut active = m.bin(c, Bin::And, aligned, in_bounds);
+                    if let Some(stride) = index.and(used.map(|u| u.stride)) {
+                        let stride = m.i32(stride);
+                        let field_valid = m.cmp(c, pred::IULT, off, stride);
+                        active = m.bin(c, Bin::And, active, field_valid);
+                    }
+                    if self.x.native.stage == HwStage::Ps {
+                        let helper =
+                            self.s
+                                .op(c, "isHelperLane", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+                        let no = self.s.m.bool(false);
+                        let visible = self.s.m.cmp(c, pred::EQ, helper, no);
+                        active = self.s.m.bin(c, Bin::And, active, visible);
+                    }
+                    let access = self.begin_guarded(Some(active));
+                    let head = self.cur;
+                    let retry = self.s.m.new_block();
+                    let done = self.s.m.new_block();
+                    let m = &mut self.s.m;
+                    let one = m.i32(1);
+                    // Guess zero first. A failed CAS supplies the next
+                    // expected value without a separate UAV load.
+                    m.terminate(head, Term::Br(retry));
+                    self.cur = retry;
+                    let expected = m.phi(retry, i32t);
+                    let replacement = match op {
+                        Atomic::Csub => {
+                            let underflow = m.cmp(retry, pred::IUGT, data, expected);
+                            let diff = m.bin(retry, Bin::Sub, expected, data);
+                            m.select(retry, underflow, zero, diff)
+                        }
+                        Atomic::Inc => {
+                            let wrap = m.cmp(retry, pred::IUGE, expected, data);
+                            let inc = m.bin(retry, Bin::Add, expected, one);
+                            m.select(retry, wrap, zero, inc)
+                        }
+                        Atomic::Dec => {
+                            let empty = m.cmp(retry, pred::EQ, expected, zero);
+                            let above_limit = m.cmp(retry, pred::IUGT, expected, data);
+                            let wrap = m.bin(retry, Bin::Or, empty, above_limit);
+                            let dec = m.bin(retry, Bin::Sub, expected, one);
+                            m.select(retry, wrap, data, dec)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let observed = compare_exchange(self, expected, replacement);
+                    let m = &mut self.s.m;
+                    m.set_phi(expected, vec![(zero, head), (observed, retry)]);
+                    let success = m.cmp(retry, pred::EQ, observed, expected);
+                    m.terminate(retry, Term::CondBr(success, done, retry));
+                    self.cur = done;
+                    self.end_guarded(access, &[(observed, zero)])[0]
+                }
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
@@ -6580,12 +6664,16 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, false, 256).unwrap();
+        lowers_native(&native).map(|_| ())
+    }
+
+    fn lowers_native(native: &NativeProgram) -> Result<Vec<u8>, crate::ShaderError> {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
+        let io = io::raise(&p, native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
-            native: &native,
+            native,
             p: &p,
             st: &st,
             io: &io,
@@ -6595,7 +6683,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+        .map(|lowered| lowered.dxil)
     }
 
     #[test]
@@ -6628,6 +6716,161 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    /// Lowers a compute program of one raw-buffer atomic (opcode `op`, with
+    /// the return flag `glc`) on a four-dword UAV, then a store of its result.
+    fn buffer_atomic_dxil(op: u32, glc: u32) -> Vec<u8> {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0 (descriptor table high dword)
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], null
+            0x7E00_0383, // v_mov_b32 v0, 3
+            0xE000_0000u32 | (op << 18) | glc,
+            0x8001_0000,
+            0xE070_0004,
+            0x8001_0000, // buffer_store_dword v0, offset:4
+            S_ENDPGM,
+        ];
+        let code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        lowers_native(&native).unwrap_or_else(|err| panic!("opcode {op:#x}, glc {glc:#x}: {err}"))
+    }
+
+    /// The bits of a DXIL module's bitcode, least significant first.
+    struct Bits<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl Bits<'_> {
+        fn fixed(&mut self, width: u32) -> u64 {
+            let mut v = 0;
+            for k in 0..width as usize {
+                let at = self.pos + k;
+                v |= u64::from(self.data[at / 8] >> (at % 8) & 1) << k;
+            }
+            self.pos += width as usize;
+            v
+        }
+
+        fn vbr(&mut self, width: u32) -> u64 {
+            let (mut v, mut shift) = (0, 0);
+            loop {
+                let chunk = self.fixed(width);
+                v |= (chunk & ((1 << (width - 1)) - 1)) << shift;
+                if chunk >> (width - 1) == 0 {
+                    return v;
+                }
+                shift += width - 1;
+            }
+        }
+
+        fn align(&mut self) {
+            self.pos = self.pos.next_multiple_of(32);
+        }
+    }
+
+    /// What a DXIL module declares and how its function branches: the
+    /// names of its functions, and whether a block branches back to itself.
+    /// Reads the unabbreviated bitstream the writer produces.
+    fn declared_and_looping(dxil: &[u8]) -> (Vec<String>, bool) {
+        let start = dxil.windows(4).position(|w| w == b"BC\xC0\xDE").unwrap();
+        let mut bits = Bits {
+            data: &dxil[start..],
+            pos: 32,
+        };
+        let (mut names, mut block, mut self_loop) = (vec![], 0, false);
+        // (block id, abbreviation id width); the outermost has no id.
+        let mut open = vec![(u64::MAX, 2)];
+        while let Some(&(id, width)) = open.last() {
+            match bits.fixed(width) {
+                0 => {
+                    bits.align();
+                    open.pop();
+                    if open.len() == 1 {
+                        break;
+                    }
+                }
+                1 => {
+                    let (id, width) = (bits.vbr(8), bits.vbr(4) as u32);
+                    bits.align();
+                    bits.fixed(32); // length in words
+                    open.push((id, width));
+                }
+                3 => {
+                    let code = bits.vbr(6);
+                    let count = bits.vbr(6);
+                    let ops: Vec<u64> = (0..count).map(|_| bits.vbr(6)).collect();
+                    match (id, code) {
+                        // Value symbol table entry: value id, then the name.
+                        (14, 1) => names.push(ops[1..].iter().map(|&c| c as u8 as char).collect()),
+                        // Function block: a conditional branch is (true,
+                        // false, condition); a false target equal to the
+                        // block itself loops.
+                        (12, 11) => {
+                            self_loop |= ops.len() == 3 && ops[1] == block;
+                            block += 1;
+                        }
+                        (12, 10) => block += 1,
+                        _ => {}
+                    }
+                }
+                other => panic!("abbreviation id {other} where the writer never abbreviates"),
+            }
+        }
+        (names, self_loop)
+    }
+
+    #[test]
+    fn buffer_counter_atomics_retry_a_compare_exchange() {
+        // inc, dec and csub have no DXIL atomic: each is a compare-exchange
+        // in a loop that retries with the value it observed, with and
+        // without the return flag. add is one atomicBinOp, with no loop.
+        for op in [0x34, 0x3c, 0x3d] {
+            for glc in [0, 1 << 14] {
+                let (names, looping) = declared_and_looping(&buffer_atomic_dxil(op, glc));
+                let has = |name: &str| names.iter().any(|n| n == name);
+                assert!(
+                    has("dx.op.atomicCompareExchange.i32"),
+                    "opcode {op:#x}, glc {glc:#x}: {names:?}"
+                );
+                assert!(!has("dx.op.atomicBinOp.i32"), "opcode {op:#x}: {names:?}");
+                assert!(looping, "opcode {op:#x}, glc {glc:#x}: no retry loop");
+            }
+        }
+        let (names, looping) = declared_and_looping(&buffer_atomic_dxil(0x32, 1 << 14));
+        assert!(names.iter().any(|n| n == "dx.op.atomicBinOp.i32"));
+        assert!(!looping);
     }
 
     #[test]
