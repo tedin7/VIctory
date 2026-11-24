@@ -12,6 +12,8 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
+use std::cell::Cell;
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
@@ -166,6 +168,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -183,6 +186,8 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// Cache each SSA value's sum so shared operands are traced once.
+    sums: Vec<Cell<Option<Sum>>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -226,6 +231,7 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            sums: vec![Cell::new(None); n],
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -348,6 +354,16 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        let cached = &self.sums[v.0 as usize];
+        if let Some(sum) = cached.get() {
+            return sum;
+        }
+        let sum = self.sum_value(v);
+        cached.set(Some(sum));
+        sum
+    }
+
+    fn sum_value(&self, v: Value) -> Sum {
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -934,6 +950,42 @@ mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    #[test]
+    fn shared_address_additions_finish_tracing() {
+        // Each addition reuses the previous value twice. The 40 additions
+        // form a small SSA graph but expand to a trillion paths.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut words = vec![0xBE89_0380]; // s_mov_b32 s9, 0
+            words.extend([0x8004_0404; 40]); // s_add_u32 s4, s4, s4
+            words.extend([
+                0xF408_0204,
+                0x0800_0000, // s_load_dwordx4 s[8:11], s[8:9], s4
+                S_ENDPGM,
+            ]);
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let program = crate::ir::build(&code, false, 256).unwrap();
+            let shift = program.blocks[0].insts[40].write(Reg::S(4)).unwrap();
+            let resources = track(&program, &[param(Table, 8, 1)], HwStage::Ps).unwrap();
+            tx.send((resources.scalar, shift)).unwrap();
+        });
+        let (scalar, shift) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("shared SSA values must be traced within the deadline");
+        worker.join().unwrap();
+        assert_eq!(
+            scalar,
+            [(
+                (0, 41),
+                Address {
+                    param: 0,
+                    offset: 0,
+                    dynamic: Some(shift),
+                }
+            )]
+        );
     }
 
     #[test]
