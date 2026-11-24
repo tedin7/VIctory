@@ -6701,6 +6701,15 @@ mod tests {
                 0xBE84_0380, // s_mov_b32 s4, 0
                 S_ENDPGM,
             ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            assert!(
+                p.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.name() == name),
+                "{name} did not decode"
+            );
             lowers(&words).unwrap_or_else(|err| panic!("{name}: {err:?}"));
         }
     }
