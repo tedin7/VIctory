@@ -4632,21 +4632,20 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            "v_mul_u32_u24" | "v_mul_i32_i24" => {
+            "v_mul_u32_u24" | "v_mul_i32_i24" | "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mul_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
+                let signed = name.ends_with("i24");
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
                 let a = self.s.m.bin(c, Bin::Shl, a, sh);
                 let a = self.s.m.bin(c, op, a, sh);
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
-                self.s.m.bin(c, Bin::Mul, a, b)
+                if name.contains("_hi_") {
+                    // The 48-bit product's bits 47:32, sign-extended when signed.
+                    self.mul_hi(a, b, signed)
+                } else {
+                    self.s.m.bin(c, Bin::Mul, a, b)
+                }
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -6627,6 +6626,32 @@ mod tests {
         ];
         for words in [add, sub] {
             lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_high_half_of_a_24_bit_product_translates() {
+        // v_mov_b32 v1, 5; v_mul_hi_*24 v0, v1, v1; then a branch on the
+        // result (only code with an effect needs its operands). The low
+        // halves lower already and act as the control.
+        let program = |mul: u32| {
+            [
+                0x7E02_0285, // v_mov_b32 v1, 5
+                mul,
+                0x7E04_0500, // v_readfirstlane_b32 s2, v0
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380, // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ]
+        };
+        for mul in [
+            0x1200_0301, // v_mul_i32_i24 v0, v1, v1
+            0x1600_0301, // v_mul_u32_u24 v0, v1, v1
+            0x1400_0301, // v_mul_hi_i32_i24 v0, v1, v1
+            0x1800_0301, // v_mul_hi_u32_u24 v0, v1, v1
+        ] {
+            lowers(&program(mul)).unwrap();
         }
     }
 
