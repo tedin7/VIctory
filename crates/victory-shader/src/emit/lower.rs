@@ -5427,12 +5427,14 @@ impl<'a> Lower<'a> {
         let (op, sample) = match name {
             "image_sample" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            // Implicit derivatives: pixel shaders only. Elsewhere they are zero,
+            // so a bias is the level of detail and a comparison reads level 0.
+            "image_sample_b" if self.s.pixel => (61, true),
+            "image_sample_b" => (62, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
-            // Implicit derivatives: pixel shaders only.
-            "image_sample_c" if self.s.pixel => (64, true),
+            "image_sample_c" => (if self.s.pixel { 64 } else { 65 }, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
@@ -5624,11 +5626,16 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
-                        to_float(self, x)
-                    } else {
-                        self.s.m.f32(0)
+                    let lod = match name {
+                        "image_sample_l" => {
+                            let x = addr_val(self, coords)?;
+                            to_float(self, x)
+                        }
+                        "image_sample_b" => {
+                            let x = addr_val(self, 0)?;
+                            to_float(self, x)
+                        }
+                        _ => self.s.m.f32(0),
                     };
                     args.extend(&os);
                     args.push(lod);
@@ -6560,7 +6567,7 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6628,6 +6635,103 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    /// Lowers a 1-thread compute shader that samples a 2D image through a
+    /// constant sampler with `op` (an `image_sample*` MIMG opcode, dmask 1,
+    /// addresses from v2) and stores the result: its DXIL container.
+    fn sampling_cs(op: u32) -> Result<Vec<u8>, crate::ShaderError> {
+        let v_mov = |dst: u32, src: u32| 0x7E00_0000 | dst << 17 | 0x001 << 9 | src;
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0 (the UAV)
+            0xFA00_0000,
+            0xF40C_0502, // s_load_dwordx8 s[20:27], s[4:5], 0x20 (the image)
+            0xFA00_0020,
+        ];
+        // The sampler words: s[12:15] = 0.
+        words.extend((12..16).map(|s| 0xBE80_0380 | s << 16));
+        // Root constants s0..s2 in v2..v4; v5 repeats v2 so that the
+        // address list of `image_sample_l` (x, y, lod) carries what the one of
+        // `image_sample_b` (bias, x, y) does.
+        words.extend([v_mov(2, 0), v_mov(3, 1), v_mov(4, 2), v_mov(5, 0)]);
+        let vaddr = if op == 0x024 { 3 } else { 2 };
+        words.extend([
+            0xF000_0000 | op << 18 | 1 << 8 | 2 << 2, // dmask 1, 2D
+            vaddr | 5 << 16 | 3 << 21,                // v0, s[20:27], s[12:15]
+            0xE070_0000,                              // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let table = |user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 3,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                table(4),
+            ],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|l| l.dxil)
+    }
+
+    #[test]
+    fn outside_pixel_shaders_a_bias_is_the_level_and_a_comparison_samples_level_zero() {
+        // Implicit derivatives exist in pixel shaders only (D3D12 rejects
+        // `sampleBias` and `sampleCmp` elsewhere); in other stages the
+        // hardware takes them as zero: the bias is the level of detail, and
+        // a comparison sample reads level 0.
+        let by_bias = sampling_cs(0x025).expect("image_sample_b in a compute shader");
+        let by_level = sampling_cs(0x024).expect("image_sample_l in a compute shader");
+        assert!(
+            by_bias == by_level,
+            "a bias outside a pixel shader is not a level"
+        );
+        let compared = sampling_cs(0x028).expect("image_sample_c in a compute shader");
+        let level_zero = sampling_cs(0x02f).expect("image_sample_c_lz in a compute shader");
+        assert!(
+            compared == level_zero,
+            "a comparison outside a pixel shader is not level zero"
+        );
+        // The two kinds of sample are not the same program.
+        assert!(by_level != level_zero);
     }
 
     #[test]
