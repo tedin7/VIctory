@@ -2475,6 +2475,67 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_bfm_b64" | "s_bfe_u64" | "s_bfe_i64" => {
+                    let control = src32(self, 1)?;
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.int_const(i64t, 63);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let offset = self.s.m.cast(c, Cast::ZExt, control, i64t);
+                    let offset = self.s.m.bin(c, Bin::And, offset, k63);
+                    let r = if name == "s_bfm_b64" {
+                        let width = src32(self, 0)?;
+                        let width = self.s.m.cast(c, Cast::ZExt, width, i64t);
+                        let width = self.s.m.bin(c, Bin::And, width, k63);
+                        let mask = self.s.m.bin(c, Bin::Shl, one, width);
+                        let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+                        self.s.m.bin(c, Bin::Shl, mask, offset)
+                    } else {
+                        let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                        let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                        let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                        let k32 = self.s.m.int_const(i64t, 32);
+                        let b = self.s.m.bin(c, Bin::Shl, b, k32);
+                        let src = self.s.m.bin(c, Bin::Or, a, b);
+
+                        // BFE width is seven bits. Keep shifts below 64 even
+                        // when the field is zero-width or at least 64 bits.
+                        let k16 = self.s.m.i32(16);
+                        let k127 = self.s.m.i32(127);
+                        let width = self.s.m.bin(c, Bin::LShr, control, k16);
+                        let width = self.s.m.bin(c, Bin::And, width, k127);
+                        let width = self.s.m.cast(c, Cast::ZExt, width, i64t);
+                        let full = self.s.m.cmp(c, pred::IUGT, width, k63);
+                        let w = self.s.m.bin(c, Bin::And, width, k63);
+                        let mask = self.s.m.bin(c, Bin::Shl, one, w);
+                        let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+                        let ones = self.s.m.int_const(i64t, -1);
+                        let mask = self.s.m.select(c, full, ones, mask);
+                        let signed = name == "s_bfe_i64";
+                        let shift = if signed { Bin::AShr } else { Bin::LShr };
+                        let src = self.s.m.bin(c, shift, src, offset);
+                        let field = self.s.m.bin(c, Bin::And, src, mask);
+                        if signed {
+                            let k64 = self.s.m.int_const(i64t, 64);
+                            let zero = self.s.m.int_const(i64t, 0);
+                            let left = self.s.m.bin(c, Bin::Sub, k64, w);
+                            let left = self.s.m.bin(c, Bin::And, left, k63);
+                            let left = self.s.m.select(c, full, zero, left);
+                            let field = self.s.m.bin(c, Bin::Shl, field, left);
+                            self.s.m.bin(c, Bin::AShr, field, left)
+                        } else {
+                            field
+                        }
+                    };
+                    let (rl, rh) = self.split64(r);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    if scc.is_some() {
+                        let s = nonzero(self, rl, rh);
+                        self.set(scc, Val::Bit(s));
+                    }
+                    Ok(())
+                }
                 _ => Err(name),
             };
         }
@@ -6626,6 +6687,25 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
+            lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_64_bit_fields_lower() {
+        for op in [0x9282_9F90, 0x9482_0100, 0x9502_0100] {
+            let words = [
+                0xBE80_0380, // s_mov_b32 s0, 0
+                0xBE81_03FF, // s_mov_b32 s1, 0x00400020 (BFE width 64, offset 32)
+                0x0040_0020,
+                0xBF07_8001, // s_cmp_lg_u32 s1, 0
+                op,          // s_bfm_b64 s[2:3], 16, 31, or s_bfe_{u,i}64 s[2:3], s[0:1], s1
+                0x8504_0302, // s_cselect_b32 s4, s2, s3
+                0xBF07_8004, // s_cmp_lg_u32 s4, 0
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE85_0380, // s_mov_b32 s5, 0
+                S_ENDPGM,
+            ];
             lowers(&words).unwrap();
         }
     }
