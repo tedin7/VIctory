@@ -5821,12 +5821,13 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        let sub = SubDword::parse(name);
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || sub.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -5871,6 +5872,18 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        // A byte or halfword lives in the aligned dword the access falls in
+        // (element strides are dword multiples, so the low bits of the byte
+        // offset are those of the address): the access is made at the dword,
+        // and `shift` is the field's bit position within it.
+        let mut shift = None;
+        if sub.is_some() {
+            let (three, eight) = (self.s.m.i32(3), self.s.m.i32(8));
+            let low = self.s.m.bin(c, Bin::And, off, three);
+            shift = Some(self.s.m.bin(c, Bin::Mul, low, eight));
+            let aligned = self.s.m.i32(!3);
+            off = self.s.m.bin(c, Bin::And, off, aligned);
+        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
@@ -5891,6 +5904,10 @@ impl<'a> Lower<'a> {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
                 let x = self.cbuffer_dword(h, a);
+                if let (Some(s), Some(shift)) = (sub, shift) {
+                    self.sub_dword_load(inst, s, x, shift, reg, guard);
+                    continue;
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -5946,6 +5963,47 @@ impl<'a> Lower<'a> {
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
+            return Ok(());
+        }
+        if let (Some(s), Some(shift), true) = (sub, shift, store) {
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let data = self.vgprs(inst, d, 1)?[0];
+            let (h, coords) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    (h, [index, off, iu])
+                }
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+            };
+            // The field, from the low half (or the high one: `d16_hi`),
+            // is merged by two atomics so that neighbouring bytes written
+            // by other lanes survive: clear its bits, then set the new ones.
+            let data = if s.hi {
+                let k16 = self.s.m.i32(16);
+                self.s.m.bin(c, Bin::LShr, data, k16)
+            } else {
+                data
+            };
+            let mask = self.s.m.i32(s.mask());
+            let field = self.s.m.bin(c, Bin::And, data, mask);
+            let field = self.s.m.bin(c, Bin::Shl, field, shift);
+            let hole = self.s.m.bin(c, Bin::Shl, mask, shift);
+            let ones = self.s.m.i32(u32::MAX);
+            let keep = self.s.m.bin(c, Bin::Xor, hole, ones);
+            let at = self.begin_guarded(guard);
+            let i32t = self.s.t.i32;
+            for (op, x) in [(1, keep), (2, field)] {
+                let mut args = vec![h, self.s.m.i32(op)];
+                args.extend(coords);
+                args.push(x);
+                self.s
+                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            }
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         if store {
@@ -6100,12 +6158,51 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        if let (Some(s), Some(shift)) = (sub, shift) {
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            self.sub_dword_load(inst, s, x, shift, reg, guard);
+            return Ok(());
+        }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Writes the byte or halfword at bit `shift` of `dword` to VGPR `reg`:
+    /// extended to 32 bits, or (`d16`) into one half with the other kept.
+    fn sub_dword_load(
+        &mut self,
+        inst: &Inst,
+        s: SubDword,
+        dword: V,
+        shift: V,
+        reg: u8,
+        guard: Option<V>,
+    ) {
+        let c = self.cur;
+        let x = self.s.m.bin(c, Bin::LShr, dword, shift);
+        let x = self.select_bits(x, if s.bits == 8 { 0 } else { 4 }, s.signed);
+        let x = if s.d16 {
+            let low = self.s.m.i32(0xFFFF);
+            let field = self.s.m.bin(c, Bin::And, x, low);
+            let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                Some(Ok(o)) => o,
+                _ => self.s.m.i32(0),
+            };
+            let (keep, up) = if s.hi { (0xFFFF, 16) } else { (0xFFFF_0000, 0) };
+            let keep = self.s.m.i32(keep);
+            let up = self.s.m.i32(up);
+            let old = self.s.m.bin(c, Bin::And, old, keep);
+            let field = self.s.m.bin(c, Bin::Shl, field, up);
+            self.s.m.bin(c, Bin::Or, old, field)
+        } else {
+            x
+        };
+        self.write(inst, Reg::V(reg), x, guard);
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
@@ -6557,10 +6654,59 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// A MUBUF access narrower than a dword.
+#[derive(Clone, Copy)]
+struct SubDword {
+    /// 8 or 16.
+    bits: u32,
+    /// A load sign-extends (`sbyte`, `sshort`).
+    signed: bool,
+    /// A load fills one half of the VGPR and keeps the other.
+    d16: bool,
+    /// The VGPR half: loads fill the high one, stores read it.
+    hi: bool,
+}
+
+impl SubDword {
+    /// `buffer_load_{ubyte,sbyte,ushort,sshort}`, `buffer_load_{ubyte,sbyte,short}_d16[_hi]`,
+    /// `buffer_store_{byte,short}[_d16_hi]`.
+    fn parse(name: &str) -> Option<Self> {
+        let (bits, signed, d16, hi) = match name.strip_prefix("buffer_")? {
+            "load_ubyte" => (8, false, false, false),
+            "load_sbyte" => (8, true, false, false),
+            "load_ushort" => (16, false, false, false),
+            "load_sshort" => (16, true, false, false),
+            "load_ubyte_d16" => (8, false, true, false),
+            "load_ubyte_d16_hi" => (8, false, true, true),
+            "load_sbyte_d16" => (8, true, true, false),
+            "load_sbyte_d16_hi" => (8, true, true, true),
+            "load_short_d16" => (16, false, true, false),
+            "load_short_d16_hi" => (16, false, true, true),
+            "store_byte" => (8, false, false, false),
+            "store_byte_d16_hi" => (8, false, false, true),
+            "store_short" => (16, false, false, false),
+            "store_short_d16_hi" => (16, false, false, true),
+            _ => return None,
+        };
+        Some(Self {
+            bits,
+            signed,
+            d16,
+            hi,
+        })
+    }
+
+    fn mask(self) -> u32 {
+        (1u32 << self.bits) - 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6628,6 +6774,133 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    /// MUBUF `op vdata, v1, s[8:11], 0 offen` (vaddr v1, no immediate offset).
+    const fn mubuf_offen(op: u32, vdata: u32) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 12,
+            0x80 << 24 | 2 << 16 | vdata << 8 | 1,
+        ]
+    }
+
+    /// A compute program that reads the descriptor of a raw UAV, copies the
+    /// root constants `s0..s3` into `v0..v3`, runs `body`, and stores `v0`.
+    /// Returns the lowered DXIL container.
+    fn lowers_with_uav(body: &[[u32; 2]]) -> Result<Vec<u8>, crate::ShaderError> {
+        let mut words = vec![
+            0xBE85_0380,                          // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, // s_load_dwordx4 s[8:11], s[4:5], 0
+            125 << 25,
+        ];
+        for i in 0..4u32 {
+            words.push(0x7E00_0000 | i << 17 | 1 << 9 | i); // v_mov_b32 v<i>, s<i>
+        }
+        words.extend(body.iter().flatten());
+        words.extend(mubuf_offen(0x1C, 0)); // buffer_store_dword v0, v1, s[8:11]
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|l| l.dxil)
+    }
+
+    /// Whether a function or global named `name` is declared in the DXIL.
+    /// Bitcode stores each character of a name as a 6-bit VBR chunk (two for
+    /// characters from 32 up), little-endian, not on byte boundaries.
+    fn mentions(dxil: &[u8], name: &str) -> bool {
+        let mut pattern = Vec::new();
+        for ch in name.bytes() {
+            let chunks = if ch < 32 {
+                vec![ch]
+            } else {
+                vec![ch & 31 | 32, ch >> 5]
+            };
+            for chunk in chunks {
+                pattern.extend((0..6).map(|bit| chunk >> bit & 1 != 0));
+            }
+        }
+        let bits: Vec<bool> = dxil
+            .iter()
+            .flat_map(|b| (0..8).map(move |bit| b >> bit & 1 != 0))
+            .collect();
+        bits.windows(pattern.len()).any(|w| w == &pattern[..])
+    }
+
+    #[test]
+    fn sub_dword_loads_read_the_dword_that_holds_them() {
+        // ubyte, sbyte, ushort, sshort, then the d16 forms (low and high).
+        for op in [0x08, 0x09, 0x0A, 0x0B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25] {
+            let dxil = lowers_with_uav(&[mubuf_offen(op, 0)])
+                .unwrap_or_else(|e| panic!("buffer load opcode {op:#x}: {e}"));
+            assert!(mentions(&dxil, "rawBufferLoad"), "opcode {op:#x}");
+            // A load never writes memory.
+            assert!(!mentions(&dxil, "atomicBinOp"), "opcode {op:#x}");
+        }
+    }
+
+    #[test]
+    fn sub_dword_stores_merge_into_the_dword_atomically() {
+        // byte, byte_d16_hi, short, short_d16_hi.
+        for op in [0x18, 0x19, 0x1A, 0x1B] {
+            let dxil = lowers_with_uav(&[mubuf_offen(op, 2)])
+                .unwrap_or_else(|e| panic!("buffer store opcode {op:#x}: {e}"));
+            assert!(mentions(&dxil, "atomicBinOp"), "opcode {op:#x}");
+        }
+        // Control: a whole-dword store needs no merge.
+        let dxil = lowers_with_uav(&[]).unwrap();
+        assert!(mentions(&dxil, "rawBufferStore"));
+        assert!(!mentions(&dxil, "atomicBinOp"));
     }
 
     #[test]
