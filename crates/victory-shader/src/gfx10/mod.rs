@@ -409,6 +409,37 @@ mod tests {
     }
 
     #[test]
+    fn image_gradient_width_is_independent_of_a16() {
+        // llvm-mc -mcpu=gfx1030: image_sample_d[_g16] with 2D coordinates.
+        for (opcode, a16, dwords) in [
+            (0xF088_0108, false, 6),
+            (0xF088_0108, true, 5),
+            (0xF088_0109, false, 4),
+            (0xF088_0109, true, 3),
+        ] {
+            let operands = 0x0061_0001 | (u32::from(a16) << 30);
+            let code = bytes(&[opcode, operands, S_ENDPGM]);
+            let Fields::Image { addr, .. } = decode(&code).unwrap()[0].fields(false) else {
+                panic!("expected an image instruction");
+            };
+            assert_eq!(addr, [Operand::Vector { reg: 1, dwords }]);
+        }
+
+        // A16 with full-width gradients: NSA uses four gradient VGPRs and
+        // one packed coordinate VGPR, in that order.
+        let code = bytes(&[0xF088_010A, 0x4061_0001, 0x0907_0503, S_ENDPGM]);
+        let insts = decode(&code).unwrap();
+        let Fields::Image { addr, .. } = insts[0].fields(false) else {
+            panic!("expected an image instruction");
+        };
+        assert_eq!(
+            addr,
+            [1, 3, 5, 7, 9].map(|reg| Operand::Vector { reg, dwords: 1 })
+        );
+        assert_eq!(insts[1].offset, 12);
+    }
+
+    #[test]
     fn follows_branches_and_skips_data() {
         let code = [
             sopp(0x04, 1), // s_cbranch_scc0 -> 8

@@ -768,7 +768,8 @@ fn data_dwords(name: &str) -> u8 {
 }
 
 /// Address dwords of an image opcode: offset, bias, compare, derivatives,
-/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
+/// coordinates, then LOD/clamp/mip. G16 packs gradients and A16 packs
+/// the coordinate body, each in pairs.
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
@@ -805,9 +806,11 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    let derivs_per_direction = if name.ends_with("_g16") {
+        derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
-    }
+        derivs
+    };
+    let body = if a16 { packed.div_ceil(2) } else { packed };
+    whole + 2 * derivs_per_direction + body
 }
